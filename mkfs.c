@@ -23,11 +23,12 @@ typedef unsigned char  uchar;
 #define CONSOLE 1
 
 // Disk layout:
-// [ boot block | sb block | free bit map | inode file start | data blocks ]
+// [ boot block | sb block | free bit map | log | inode file start | data blocks ]
 
 int nbitmap = FSSIZE/(BSIZE*8) + 1;
 int nmeta;    // Number of meta blocks (boot, sb, nlog, inode, bitmap)
 int nblocks;  // Number of data blocks
+int nlogblocks = LOGSIZE;
 
 int fsfd;
 struct superblock sb;
@@ -99,13 +100,14 @@ main(int argc, char *argv[])
   }
 
   // 1 fs block = 1 disk sector
-  nmeta = 2 + nbitmap;
+  nmeta = 2 + nbitmap + nlogblocks;
   nblocks = FSSIZE - nmeta;
 
   sb.size = xint(FSSIZE);
   sb.nblocks = xint(nblocks);
   sb.bmapstart = xint(2);
-  sb.inodestart = xint(2+nbitmap);
+  sb.logstart = xint(2 + nbitmap);
+  sb.inodestart = xint(2+nlogblocks+nbitmap);
 
   printf("nmeta %d (boot, super, bitmap blocks %u) blocks %d total %d\n",
        nmeta, nbitmap, nblocks, FSSIZE);
