@@ -25,6 +25,139 @@
 // only one device
 struct superblock sb;
 
+// Log API
+
+// Begin a log transaction
+static void log_begin_tx() {
+  struct buf* log_header_buf = bread(ROOTDEV, sb.logstart);
+
+  struct logheader log_header;
+  log_header.commit = LOG_INVALID;
+  log_header.size = 0;
+
+  memmove(&log_header_buf->data, &log_header, sizeof(log_header));
+
+  bwrite(log_header_buf);
+  brelse(log_header_buf);
+}
+
+// Write a block to the log
+static void log_write(struct buf* buf) {
+  struct buf* log_header_buf = bread(ROOTDEV, sb.logstart);
+
+  struct logheader log_header;
+  memmove(&log_header, &log_header_buf->data, sizeof(struct logheader));
+
+  if (log_header.commit != LOG_INVALID) {
+    panic("log_write: writing to log when commit is not invalid");
+  }
+
+  if (log_header.size >= LOGSIZE-1) {
+    panic("log_write: log is full");
+  }
+
+  // Write data block to log
+  struct buf* data_blk = bread(ROOTDEV, sb.logstart + log_header.size + 1);
+  memmove(&data_blk->data, &buf->data, BSIZE);
+  bwrite(data_blk);
+
+  // Update header and write it to disk
+  log_header.disk_loc[log_header.size] = buf->blockno;
+  log_header.size++;
+  memmove(&log_header_buf->data, &log_header, sizeof(struct logheader));
+  bwrite(log_header_buf);
+
+  brelse(data_blk);
+  brelse(log_header_buf);
+}
+
+// Completes the transaction and flushes it to disk
+static void log_commit_tx() {
+  struct buf* log_header_buf = bread(ROOTDEV, sb.logstart);
+  struct logheader log_header;
+
+  memmove(&log_header, &log_header_buf->data, sizeof(struct logheader));
+
+  if (log_header.commit != LOG_INVALID) {
+    panic("log_commit_tx: commit flag is not invalid before commit");
+  }
+
+  if (log_header.size >= LOGSIZE) {
+    panic("log_commit_tx: log is full");
+  }
+
+  // Update commit to VALID and write header to disk
+  log_header.commit = LOG_VALID;
+  memmove(&log_header_buf->data, &log_header, sizeof(struct logheader));
+  bwrite(log_header_buf);
+  brelse(log_header_buf);
+
+  // Update log header
+  log_header_buf = bread(ROOTDEV, sb.logstart);
+  memmove(&log_header, &log_header_buf->data, sizeof(struct logheader));
+
+  if (log_header.commit != LOG_VALID) {
+    panic("log_commit_tx: commit flag is not valid during commit");
+  }
+
+  if (log_header.size >= LOGSIZE) {
+    panic("log_commit_tx: log is full");
+  }
+
+  // Transfer blocks
+  for (int i = 0; i < log_header.size; i++) {
+    struct buf* data_buf = bread(ROOTDEV, log_header.disk_loc[i]); // The actual disk block
+    struct buf* log_buf = bread(ROOTDEV, sb.logstart + i + 1); // The corresponding block in the log
+
+    // Write to correct disk location
+    memmove(&data_buf->data, &log_buf->data, BSIZE);
+    bwrite(data_buf);
+
+    brelse(data_buf);
+    brelse(log_buf);
+  }
+
+  // Complete transaction by setting header flag to INVALID
+  log_header.commit = LOG_INVALID;
+  memmove(&log_header_buf->data, &log_header, sizeof(struct logheader));
+  bwrite(log_header_buf);
+
+  brelse(log_header_buf);
+}
+
+static void log_apply() {
+  cprintf("log_apply: start\n");
+
+  struct buf* log_header_buf = bread(ROOTDEV, sb.logstart);
+  struct logheader log_header;
+
+  memmove(&log_header, &log_header_buf->data, sizeof(struct logheader));
+
+  // If commited, apply the log to the disk
+  if (log_header.commit == LOG_VALID) {
+    // Transfer blocks
+    for (int i = 0; i < log_header.size; i++) {
+      struct buf* data_buff = bread(ROOTDEV, log_header.disk_loc[i]); // on disk
+      struct buf* log_buff = bread(ROOTDEV, sb.logstart + i + 1); // in log
+
+      // Write to correct disk location
+      memmove(&data_buff->data, &log_buff->data, BSIZE);
+      bwrite(data_buff);
+
+      brelse(data_buff);
+      brelse(log_buff);
+    }
+  }
+  cprintf("log_apply: commit=%d\n", log_header.commit);
+
+  log_header.commit = LOG_INVALID;
+  log_header.size = 0;
+
+  memmove(&log_header_buf->data, &log_header, sizeof(struct logheader));
+  bwrite(log_header_buf);
+  brelse(log_header_buf);
+}
+
 // Read the super block.
 void readsb(int dev, struct superblock *sb) {
   struct buf *bp;
@@ -49,6 +182,7 @@ static void bmark(struct buf *bp, uint start, uint end, bool used)
     }
   }
   bp->flags |= B_DIRTY; // mark our update
+  log_write(bp);
 }
 
 // Blocks.
@@ -99,6 +233,7 @@ static void bfree(int dev, uint b, uint n)
   bmark(bp, b % BPB, (b+n-1) % BPB, false);
   brelse(bp);
 }
+
 
 // Inodes.
 //
@@ -174,9 +309,10 @@ void iinit(int dev) {
   initsleeplock(&icache.inodefile.lock, "inodefile");
 
   readsb(dev, &sb);
-  cprintf("sb: size %d nblocks %d bmap start %d inodestart %d\n", sb.size,
-          sb.nblocks, sb.bmapstart, sb.inodestart);
-
+  cprintf("sb: size %d nblocks %d bmap start %d logstart %d inodestart %d\n", sb.size,
+          sb.nblocks, sb.bmapstart, sb.logstart, sb.inodestart);
+  
+  log_apply();
   init_inodefile(dev);
 }
 
@@ -193,6 +329,26 @@ static void read_dinode(uint inum, struct dinode *dip) {
   if (!holding_inodefile_lock)
     unlocki(&icache.inodefile);
 
+}
+
+// Update the dinode by writing inode to disk
+void update_dinode(struct inode* ip){
+  int holding_inodefile_lock = holdingsleep(&icache.inodefile.lock);
+  if (!holding_inodefile_lock)
+    locki(&icache.inodefile);
+
+  struct dinode curr_dinode;
+  curr_dinode.type = ip->type;
+  curr_dinode.devid = ip->devid;
+  curr_dinode.size = ip->size;
+  memmove(&curr_dinode.data, &ip->data, sizeof(struct extent) * EXTENTS);
+
+  if (writei(&icache.inodefile, (char *) &curr_dinode, INODEOFF(ip->inum), sizeof(curr_dinode)) < 0) {
+      panic("update_dinode: error writing inode to disk");
+  }
+
+  if (!holding_inodefile_lock)
+    unlocki(&icache.inodefile);
 }
 
 // Find the inode with number inum on device dev
@@ -230,30 +386,6 @@ static struct inode *iget(uint dev, uint inum) {
   return ip;
 }
 
-void update_dinode(struct inode* ip){
-  struct inode *inodefile = &icache.inodefile;
-  struct dinode curr_dinode;
-
-  read_dinode(ip->inum, &curr_dinode);
-
-  if (ip->size != curr_dinode.size){
-    curr_dinode.size = ip->size;
-    //cprintf("update_dinode: size %d\n", curr_dinode.size);
-
-    for (int i = 0; i < EXTENTS; i++) {
-      if (ip->data[i].startblkno == 0) break;
-      curr_dinode.data[i].startblkno = ip->data[i].startblkno;
-      curr_dinode.data[i].nblocks = ip->data[i].nblocks;
-      //cprintf("update_dinode: startblkno %d, nblocks %d\n", curr_dinode.data[i].startblkno, curr_dinode.data[i].nblocks);
-    }
-
-    acquiresleep(&inodefile->lock);
-    if (writei(inodefile, (char *) &curr_dinode, INODEOFF(ip->inum), sizeof(curr_dinode)) < 0) {
-        //cprintf("update_dinode: inodefile write failed\n");
-    }
-    releasesleep(&inodefile->lock);
-  }
-}
 
 // looks up a path, if valid, populate its inode struct
 struct inode *iopen(char *path) {
@@ -273,6 +405,7 @@ struct inode *iopen(char *path) {
       cprintf("name %s\n",dirent.name);
     }
     */
+    
     locki(inode);
     unlocki(inode);
     //cprintf("iopen: %s, inum %d\n", path, inode->inum);
@@ -282,12 +415,11 @@ struct inode *iopen(char *path) {
 }
 
 struct inode *concurrent_icreate(char *path) {
-  struct inode *inodefile = iget(ROOTDEV, INODEFILEINO);
   struct inode *inode;
 
-  acquiresleep(&inodefile->lock);
+  log_begin_tx();
   inode = icreate(path);
-  releasesleep(&inodefile->lock);
+  log_commit_tx();
 
   return inode;
 }
@@ -303,7 +435,6 @@ struct inode *icreate(char *path) {
   memset(dinode.data, 0, sizeof(dinode.data));
 
   // inodefile is an array of dinodes
-  acquiresleep(&inodefile->lock);
   // Search for the first inode in inodefile that is not in use
   int inum = inodefile->size / sizeof(dinode);
   for (int i = 0; i < NINODE; i++) {
@@ -316,8 +447,7 @@ struct inode *icreate(char *path) {
       break;
     }
   }
-  writei(inodefile, (char *)&dinode, INODEOFF(inum), sizeof(dinode));
-  releasesleep(&inodefile->lock);
+  concurrent_writei(inodefile, (char *)&dinode, INODEOFF(inum), sizeof(dinode));
 
   // Create a new directory entry and write it to the parent directory
   char name[DIRSIZ];
@@ -335,10 +465,9 @@ struct inode *icreate(char *path) {
   // Create the new directory entry
   dirent.inum = inum;
   strncpy(dirent.name, name, DIRSIZ);
-
-  if (parent_dir == NULL) return NULL;
   concurrent_writei(parent_dir, (char *)&dirent, off, sizeof(dirent));
 
+  // Update the size of the inodefile and parent directory
   acquire(&icache.lock);
   if (inum >= inodefile->size / sizeof(dinode)) {
     inodefile->size += sizeof(dinode);
@@ -347,9 +476,6 @@ struct inode *icreate(char *path) {
     parent_dir->size += sizeof(dirent);
   }
   release(&icache.lock);
-
-  update_dinode(inodefile);
-  update_dinode(parent_dir);
 
   struct inode *inode = iget(inodefile->dev, inum);
 
@@ -409,7 +535,6 @@ int iunlink(char *path) {
   }
 
   // Remove the dinode from the inodefile
-  acquiresleep(&inodefile->lock);
   struct dinode dinode;
   read_dinode(inode->inum, &dinode);
   dinode.size = -1;
@@ -421,10 +546,7 @@ int iunlink(char *path) {
     dinode.data[i].nblocks = 0;
   }
   //cprintf("iunlink: set dinode %d size to -1\n", inode->inum);
-  writei(inodefile, (char *)&dinode, INODEOFF(inode->inum), sizeof(dinode));
-  releasesleep(&inodefile->lock);
-
-  update_dinode(inodefile);
+  concurrent_writei(inodefile, (char *)&dinode, INODEOFF(inode->inum), sizeof(dinode));
 
   return 0;
 }
@@ -589,13 +711,17 @@ int concurrent_writei(struct inode *ip, char *src, uint off, uint n) {
   retval = writei(ip, src, off, n);
   unlocki(ip);
 
-  acquire(&icache.lock);
-  int n_append = off + n - ip->size;
-  if (n_append > 0) {
-    ip->size += retval;
-  }
-  release(&icache.lock);
-  update_dinode(ip);
+  return retval;
+}
+
+int log_concurrent_writei(struct inode *ip, char *src, uint off, uint n) {
+  int retval;
+
+  locki(ip);
+  log_begin_tx();
+  retval = writei(ip, src, off, n);
+  log_commit_tx();
+  unlocki(ip);
 
   return retval;
 }
@@ -658,14 +784,16 @@ int writei(struct inode *ip, char *src, uint off, uint n) {
 
   int retval = 0;
   if (n_overwrite > 0) {
-    writei_file(ip, src, off_extent, n_overwrite, idx_extent);
+    log_writei_file(ip, src, off_extent, n_overwrite, idx_extent);
     retval += n_overwrite;
   }
 
   if (n_append > 0) {
     int n_balloc = off + n - capacity;
-    writei_append(ip, src, off_extent, n_append, n_balloc, idx_extent);
+    log_writei_append(ip, src, off_extent, n_append, n_balloc, idx_extent);
     retval += n_append;
+    ip->size += n_append;
+    update_dinode(ip);
   }
 
   return retval;
@@ -756,6 +884,93 @@ int writei_append(struct inode *ip, char *src, int off_extent, int n_append, int
   }
 
   // TODO: update dinode in inodefile
+  return n_append;
+}
+
+int log_writei_file(struct inode *ip, char *src, int off_extent, int n, int idx_extent) {
+  int tot, m;
+  struct buf *bp;
+  struct extent *cur_extent = ip->data + idx_extent;
+
+  for (tot = 0; tot < n; tot += m, off_extent += m, src += m) {
+    // Reached the end of the extent
+    if (off_extent >= cur_extent->nblocks * BSIZE) {
+      // Move to the next extent, reset offset and m
+      
+      //if (cur_extent->nblocks != 0) cprintf("writei_file: INUM %d, prev extent m %d, off_extent %d, startblkno %d, nblocks %d\n", ip->inum, m, off_extent, cur_extent->startblkno, cur_extent->nblocks);
+      cur_extent++;
+      off_extent = 0;
+      m = 0;
+      //if (cur_extent->nblocks != 0) cprintf("writei_file: INUM %d, next extent m %d, off_extent %d, startblkno %d, nblocks %d\n", ip->inum, m, off_extent, cur_extent->startblkno, cur_extent->nblocks);
+    } else {
+      // Write to the current extent
+      if (cur_extent->startblkno >= FSSIZE) {
+        for (int i = 0; i < EXTENTS; i++) {
+          //if (cur_extent->nblocks != 0) cprintf("writei_file: INUM %d, startblkno %d, nblocks %d. off_extent %d, idx_extend %d\n", ip->inum, ip->data[i].startblkno, ip->data[i].nblocks, off_extent, idx_extent);
+        }
+        //cprintf("writei_file: startblkno %d >= FSSIZE %d\n", cur_extent->startblkno, FSSIZE);
+      }
+      bp = bread(ip->dev, cur_extent->startblkno + off_extent / BSIZE);
+      m = min(n - tot, BSIZE - off_extent % BSIZE);
+      memmove(bp->data + off_extent % BSIZE, src, m);
+      log_write(bp);
+      brelse(bp);
+    }
+  }
+  return n;
+}
+
+int log_writei_append(struct inode *ip, char *src, int off_extent, int n_append, int n_balloc, int idx_extent) {
+  struct extent *cur_extent = ip->data + idx_extent;
+
+  if (n_balloc > 0) {
+    // Allocate new blocks
+    int nblocks = n_balloc / BSIZE + (n_balloc % BSIZE == 0 ? 0 : 1);
+    int startblkno = balloc(ip->dev, nblocks);
+
+    // The inode has already an extent at idx_extent, move to the next extent
+    int allocated_extent = idx_extent;
+    while (cur_extent->nblocks != 0) {
+      allocated_extent++;
+      cur_extent++;
+    }
+    
+    // Update inode
+    cprintf("writei_append: INUM %d, allocate %d bytes for extent %d, nblocks %d, startblkno %d\n", ip->inum, n_balloc, allocated_extent, nblocks, startblkno);
+    cur_extent->startblkno = startblkno;
+    cur_extent->nblocks = nblocks;
+  }
+
+  int tot, m;
+  struct buf *bp;
+  cur_extent = ip->data + idx_extent;
+
+  for (tot = 0; tot < n_append; tot += m, off_extent += m, src += m) {
+    // Reached the end of the extent
+    if (off_extent >= cur_extent->nblocks * BSIZE) {
+      // Move to the next extent, reset offset and m
+      
+      //if (cur_extent->nblocks != 0) cprintf("writei_file: INUM %d, prev extent m %d, off_extent %d, startblkno %d, nblocks %d\n", ip->inum, m, off_extent, cur_extent->startblkno, cur_extent->nblocks);
+      cur_extent++;
+      off_extent = 0;
+      m = 0;
+      //if (cur_extent->nblocks != 0) cprintf("writei_file: INUM %d, next extent m %d, off_extent %d, startblkno %d, nblocks %d\n", ip->inum, m, off_extent, cur_extent->startblkno, cur_extent->nblocks);
+    } else {
+      // Write to the current extent
+      if (cur_extent->startblkno >= FSSIZE) {
+        for (int i = 0; i < EXTENTS; i++) {
+          //if (cur_extent->nblocks != 0) cprintf("writei_file: INUM %d, startblkno %d, nblocks %d. off_extent %d, idx_extend %d\n", ip->inum, ip->data[i].startblkno, ip->data[i].nblocks, off_extent, idx_extent);
+        }
+        //cprintf("writei_file: startblkno %d >= FSSIZE %d\n", cur_extent->startblkno, FSSIZE);
+      }
+      bp = bread(ip->dev, cur_extent->startblkno + off_extent / BSIZE);
+      m = min(n_append - tot, BSIZE - off_extent % BSIZE);
+      memmove(bp->data + off_extent % BSIZE, src, m);
+      log_write(bp);
+      brelse(bp);
+    }
+  }
+
   return n_append;
 }
 
@@ -888,4 +1103,3 @@ See namex
 struct inode *nameiparent(char *path, char *name) {
   return namex(path, 1, name);
 }
-

@@ -19,7 +19,7 @@
 struct devsw devsw[NDEV];
 
 static struct file_info file_table[NFILE];
-struct spinlock file_table_lock;
+struct sleeplock file_table_lock;
 
 /** Open the file specified by path in the given access mode.
  * @param access_mode The file access mode.
@@ -27,7 +27,8 @@ struct spinlock file_table_lock;
  * @return The file descriptor index for the current process.
  */ 
 int file_open(int access_mode, char *path) {
-    struct proc *my_proc = myproc(); 
+    acquiresleep(&file_table_lock);
+    struct proc *my_proc = myproc();
 
     // Finds an open spot in the process file table
     int proc_ftable_index = 0;
@@ -37,9 +38,10 @@ int file_open(int access_mode, char *path) {
 
     // Error if the process file table is full
     if (proc_ftable_index == NOFILE) {
+        cprintf("[ERROR] file_open: process file table is full\n");
+        releasesleep(&file_table_lock);
         return -1;
     }
-
     // Finds an open entry in the global file table
     int global_ftable_index = 0;
     while (global_ftable_index < NFILE && file_table[global_ftable_index].ref_count != 0) {
@@ -52,10 +54,11 @@ int file_open(int access_mode, char *path) {
     }
 
     if (inode_ptr == NULL) {
+        cprintf("[ERROR] file_open: could not open inode\n");
+        releasesleep(&file_table_lock);
         return -1;
     }
     
-    acquire(&file_table_lock);
     file_table[global_ftable_index] = (struct file_info){ 
       .node=inode_ptr,
       .pipe=NULL,
@@ -66,9 +69,9 @@ int file_open(int access_mode, char *path) {
       .path=path,
       .gfd=global_ftable_index
     };
-    release(&file_table_lock);
 
     my_proc->files[proc_ftable_index] = &file_table[global_ftable_index];
+    releasesleep(&file_table_lock);
 
     return proc_ftable_index;
 }
@@ -96,29 +99,28 @@ int file_dup(int fd_copy) {
     if (fi->node == NULL) return -1;
   }
 
-  acquire(&file_table_lock);
+  acquiresleep(&file_table_lock);
   my_proc->files[fd] = fi;
   fi->ref_count++;
-  release(&file_table_lock);
+  releasesleep(&file_table_lock);
 
   return fd;
 }
 
 int file_stat(int fd, struct stat *stat_ptr) {
   struct proc *my_proc = (struct proc *)myproc();
-  acquire(&file_table_lock);
   if (my_proc->files[fd] == NULL) {
     // no open file at this descriptor
-    release(&file_table_lock);
     return -1;
   }
   if (my_proc->files[fd]->node == NULL) {
     // underlying inode ptr is null
     return -1;
   }
+  acquiresleep(&file_table_lock);
   struct inode *node = my_proc->files[fd]->node;
-  release(&file_table_lock);
   concurrent_stati(node, stat_ptr);
+  releasesleep(&file_table_lock);
   return 0;
 }
 
@@ -159,13 +161,11 @@ int file_write(int fd, char *buf, int nr_bytes) {
     return pipe_write(fd, buf, nr_bytes);
   }
 
-  acquiresleep(&file->lock);
-  int offset = concurrent_writei(file->node, buf, file->offset, nr_bytes);
-  releasesleep(&file->lock);
+  acquiresleep(&file_table_lock);
+  int offset = log_concurrent_writei(file->node, buf, file->offset, nr_bytes);
 
-  acquire(&file_table_lock);
   my_proc->files[fd]->offset += offset;
-  release(&file_table_lock);
+  releasesleep(&file_table_lock);
   return offset;
 }
 
@@ -210,13 +210,12 @@ int file_read(int fd, char *buf, int nr_bytes) {
   if(fi->isPipe) {
     return pipe_read(fd, buf, nr_bytes);
   }
-  acquiresleep(&fi->lock);
-  int offset = concurrent_readi(fi->node, buf, fi->offset, nr_bytes);
-  releasesleep(&fi->lock);
 
-  acquire(&file_table_lock);
+  acquiresleep(&file_table_lock);
+  int offset = concurrent_readi(fi->node, buf, fi->offset, nr_bytes);
+
   my_proc->files[fd]->offset += offset;
-  release(&file_table_lock);
+  releasesleep(&file_table_lock);
   return offset;
 }
 
@@ -224,9 +223,10 @@ int file_close(int fd) {
   struct proc *my_proc = myproc();
   struct file_info *fi = my_proc->files[fd];
 
-  acquire(&file_table_lock);
+  acquiresleep(&file_table_lock);
   if (fi->isPipe) {
     if (fi->pipe == NULL) {
+      releasesleep(&file_table_lock);
       return -1;
     }
 
@@ -262,7 +262,6 @@ int file_close(int fd) {
 
     // Clean up if this is the last reference to the file_info
     // cprintf("file_close: ref_count = %d\n", fi->ref_count);
-    acquiresleep(&fi->lock);
     if (--fi->ref_count <= 0) {
         // Release the inode if this is the last reference to it
         irelease(fi->node);
@@ -270,12 +269,12 @@ int file_close(int fd) {
           
         *fi = (struct file_info) { 0 };
     }
-    releasesleep(&fi->lock);
   }
-  release(&file_table_lock);
 
   // Remove the file_info from the process's file table
   my_proc->files[fd] = NULL;
+
+  releasesleep(&file_table_lock);
   return 0;
 }
 
@@ -304,7 +303,7 @@ int pipe(int *fd_arr) {
 
   j = 0;
   int gfd[2] = {-1,-1};
-  acquire(&file_table_lock);
+  acquiresleep(&file_table_lock);
   for (int i = 0; i < NFILE; i++) {
     if (file_table[i].ref_count)
       continue;
@@ -313,7 +312,7 @@ int pipe(int *fd_arr) {
   }
   if (gfd[1] == -1) {
     // no free global file descriptor
-    release(&file_table_lock);
+    releasesleep(&file_table_lock);
     kfree((char *) pipe);
     return -1;
   }
@@ -342,7 +341,7 @@ int pipe(int *fd_arr) {
   file_table[gfd[1]] = fi_write;
   myproc()->files[fd_arr[0]] = &(file_table[gfd[0]]);
   myproc()->files[fd_arr[1]] = &(file_table[gfd[1]]);
-  release(&file_table_lock);
+  releasesleep(&file_table_lock);
   return 0;
 }
 
