@@ -48,15 +48,14 @@ int file_open(int access_mode, char *path) {
 
     struct inode *inode_ptr = iopen(path);
     if (inode_ptr == NULL && (access_mode & 0xF00) == O_CREATE) {
-        acquiresleep(&file_table[global_ftable_index].lock);
         inode_ptr = concurrent_icreate(path);
-        releasesleep(&file_table[global_ftable_index].lock);
     }
 
     if (inode_ptr == NULL) {
         return -1;
     }
-
+    
+    acquire(&file_table_lock);
     file_table[global_ftable_index] = (struct file_info){ 
       .node=inode_ptr,
       .pipe=NULL,
@@ -67,8 +66,10 @@ int file_open(int access_mode, char *path) {
       .path=path,
       .gfd=global_ftable_index
     };
+    release(&file_table_lock);
+
     my_proc->files[proc_ftable_index] = &file_table[global_ftable_index];
-    
+
     return proc_ftable_index;
 }
 
